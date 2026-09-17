@@ -83,7 +83,7 @@ def test_spawn_eventually_happens():
     manager = make_manager(rng_seed=2)
     spawn_within_bound(manager)
     assert manager.active.kind in POWERUP_KINDS
-    assert manager.active.hotkey in {"1", "2", "3", "4"}
+    assert manager.active.hotkey == "E"
 
 
 def test_spawn_position_inside_center_band():

@@ -66,8 +66,9 @@ def draw_text(
     color: tuple[int, int, int],
     center: tuple[float, float] | None = None,
     topleft: tuple[float, float] | None = None,
+    topright: tuple[float, float] | None = None,
 ) -> pygame.Rect:
-    """Render one line of text anchored at ``center`` or ``topleft``.
+    """Render one line of text anchored at ``center``, ``topleft`` or ``topright``.
 
     Returns:
         The blit rectangle (handy for hit tests and layout math).
@@ -78,6 +79,8 @@ def draw_text(
         rect.center = (int(center[0]), int(center[1]))
     elif topleft is not None:
         rect.topleft = (int(topleft[0]), int(topleft[1]))
+    elif topright is not None:
+        rect.topright = (int(topright[0]), int(topright[1]))
     surface.blit(rendered, rect)
     return rect
 

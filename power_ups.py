@@ -136,15 +136,18 @@ class PowerUpManager:
         self.pending_hint = None
 
     def _spawn(self) -> None:
-        """Place a new random power-up on screen with a fresh hotkey."""
+        """Place a new random power-up on screen with its activation key.
+
+        Every power-up shares the single activation key "E" (digits 1-6 are
+        reserved for element choices); only one is ever active at a time.
+        """
         kind = self._rng.choice(POWERUP_KINDS)
         x = self._rng.uniform(config.WINDOW_WIDTH * 0.3, config.WINDOW_WIDTH * 0.7)
         y = self._rng.uniform(config.WINDOW_HEIGHT * 0.28, config.WINDOW_HEIGHT * 0.5)
-        hotkey = str(POWERUP_KINDS.index(kind) + 1)
         self.active = PowerUp(
             kind=kind,
             position=(x, y),
-            hotkey=hotkey,
+            hotkey="E",
             lifetime=config.POWERUP_LIFETIME_ROUNDS,
         )
 
