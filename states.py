@@ -142,6 +142,12 @@ class Game:
         if self.audio is not None:
             self.audio.play(name)
 
+    def match_or_none(self) -> Match | None:
+        """The live match object when the duel state owns one, else ``None``."""
+        game_state = self.machine.states.get("game")
+        match = getattr(game_state, "match", None)
+        return match if isinstance(match, Match) else None
+
     # -- Frame drivers -------------------------------------------------------
 
     def handle_event(self, event: pygame.event.Event) -> None:
