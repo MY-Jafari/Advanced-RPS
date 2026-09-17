@@ -169,6 +169,93 @@ GLOW_PULSE_SPEED = 6.0  # radians/second of the winner glow pulse
 
 MAX_PARTICLES = 400
 PARTICLE_GRAVITY = 340.0  # px/s^2 applied to most particle kinds
+PARTICLE_SWAY_SPEED = 3.0  # radians/second of the paper-flake flutter
+
+# Per-element burst recipes. Values: colors to pick from, spawn count range,
+# launch speed range (px/s), lifetime range (s), size range (px), gravity
+# multiplier (negative = buoyant, e.g. flames rising), air drag (1/s) and
+# horizontal sway amplitude (px/s^2, for fluttering paper).
+PARTICLE_PRESETS = {
+    "rock": {
+        "shape": "square",
+        "colors": ((150, 150, 158), (110, 110, 118), (200, 200, 206)),
+        "count": (18, 26),
+        "speed": (60, 240),
+        "lifetime": (0.4, 0.9),
+        "size": (2, 5),
+        "gravity_scale": 1.0,
+        "drag": 1.2,
+        "sway": 0.0,
+    },
+    "paper": {
+        "shape": "flake",
+        "colors": ((235, 238, 242), (210, 215, 225), (255, 255, 255)),
+        "count": (16, 24),
+        "speed": (40, 140),
+        "lifetime": (0.8, 1.4),
+        "size": (2, 4),
+        "gravity_scale": 0.15,
+        "drag": 2.0,
+        "sway": 26.0,
+    },
+    "scissors": {
+        "shape": "circle",
+        "colors": ((170, 182, 200), (220, 228, 240), (140, 150, 170)),
+        "count": (20, 30),
+        "speed": (140, 340),
+        "lifetime": (0.25, 0.5),
+        "size": (1, 3),
+        "gravity_scale": 0.6,
+        "drag": 0.8,
+        "sway": 0.0,
+    },
+    "fire": {
+        "shape": "circle",
+        "colors": ((255, 122, 40), (255, 180, 60), (255, 80, 30)),
+        "count": (24, 36),
+        "speed": (40, 180),
+        "lifetime": (0.5, 1.0),
+        "size": (2, 6),
+        "gravity_scale": -0.5,
+        "drag": 1.8,
+        "sway": 6.0,
+    },
+    "water": {
+        "shape": "circle",
+        "colors": ((64, 150, 255), (120, 190, 255), (40, 110, 220)),
+        "count": (22, 32),
+        "speed": (80, 300),
+        "lifetime": (0.4, 0.9),
+        "size": (2, 4),
+        "gravity_scale": 1.2,
+        "drag": 0.4,
+        "sway": 0.0,
+    },
+    "earth": {
+        "shape": "square",
+        "colors": ((172, 124, 74), (140, 100, 60), (96, 72, 48)),
+        "count": (20, 30),
+        "speed": (50, 220),
+        "lifetime": (0.5, 1.0),
+        "size": (2, 6),
+        "gravity_scale": 1.1,
+        "drag": 1.0,
+        "sway": 0.0,
+    },
+}
+
+# Generic white-hot clash burst for round impacts and pickups.
+IMPACT_PRESET = {
+    "shape": "circle",
+    "colors": ((255, 255, 255), (255, 190, 60), (120, 190, 255)),
+    "count": (26, 40),
+    "speed": (120, 420),
+    "lifetime": (0.2, 0.5),
+    "size": (1, 4),
+    "gravity_scale": 0.5,
+    "drag": 1.5,
+    "sway": 0.0,
+}
 
 # ---------------------------------------------------------------------------
 # Audio (procedural — no sound files required)
