@@ -47,6 +47,14 @@ TIES: dict[Element, Element] = {
     "earth": "paper",
 }
 
+# Short thematic explanation for the three tie pairs, shown on the help
+# screen. Keys are unordered element pairs.
+TIE_JUSTIFICATIONS: dict[frozenset, str] = {
+    frozenset(("rock", "fire")): "Fire cannot melt rock, and rock cannot smother fire.",
+    frozenset(("paper", "earth")): "Paper rests on the earth; neither gives way.",
+    frozenset(("scissors", "water")): "Blades part water, but water rusts the blades.",
+}
+
 # Short thematic explanation for every winning pair, shown on the help
 # screen. Keys are (winner, loser) pairs.
 JUSTIFICATIONS: dict[tuple[Element, Element], str] = {
