@@ -311,6 +311,7 @@ class Match:
         self.rounds_played = 0
         self.player = Player("Player")
         self.opponent = Player("AI")
+        self.player_damage_multiplier = 1.0  # armed by the double-damage power-up
         self._regenerated_through = 0  # rounds_played count already regenerated for
 
     def start_round(self) -> None:
@@ -359,7 +360,7 @@ class Match:
             bonus = self.player.combo_bonus_percent()
             self.player.combo += 1
             self.opponent.combo = 0
-            player_dealt = scaled_damage(base_damage(player_choice), bonus)
+            player_dealt = int(scaled_damage(base_damage(player_choice), bonus) * self.player_damage_multiplier)
             if self.opponent.use_shield():
                 ai_shield_used = True
                 player_dealt = 0
@@ -398,6 +399,9 @@ class Match:
         )
         self.rounds_played += 1
         self.round_number += 1
+        # The double-damage bonus is consumed after exactly one round, win or
+        # lose, so it can never stack or linger.
+        self.player_damage_multiplier = 1.0
         return result
 
     def is_over(self) -> bool:
