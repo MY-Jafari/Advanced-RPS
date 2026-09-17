@@ -55,11 +55,11 @@ DAMAGE_FROM_ELEMENTAL = 22  # HP lost when losing a round against an elemental c
 DRAW_DAMAGE = 0  # HP lost on a tied round
 
 # ---------------------------------------------------------------------------
-# Balance: combo multiplier
+# Balance: combo multiplier (integer percents keep damage math deterministic)
 # ---------------------------------------------------------------------------
 
-COMBO_STEP_BONUS = 0.10  # +10% damage per consecutive win
-COMBO_MAX_BONUS = 0.50  # damage bonus cap after many wins in a row
+COMBO_STEP_BONUS_PERCENT = 10  # +10% damage per consecutive win
+COMBO_MAX_BONUS_PERCENT = 50  # damage bonus cap
 
 # ---------------------------------------------------------------------------
 # Balance: energy

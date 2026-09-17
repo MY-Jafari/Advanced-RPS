@@ -23,4 +23,5 @@ def test_energy_and_hp_bounds_are_sane():
     assert config.DAMAGE_FROM_CLASSIC < config.DAMAGE_FROM_ELEMENTAL
     assert config.COST_CLASSIC < config.COST_ELEMENTAL
     assert config.ENERGY_REGEN_PER_ROUND <= config.MAX_ENERGY
-    assert 0 <= config.COMBO_STEP_BONUS <= 1.0
+    assert 0 <= config.COMBO_STEP_BONUS_PERCENT <= 100
+    assert config.COMBO_STEP_BONUS_PERCENT <= config.COMBO_MAX_BONUS_PERCENT
