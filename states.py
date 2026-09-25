@@ -1,953 +1,590 @@
-"""State machine and screens for Elemental RPS.
-
-Every screen is a :class:`AppState`: menu, mode select, help, the duel
-itself and the result screen. A :class:`StateMachine` swaps states behind a
-short fade transition; a shared :class:`Game` context owns cross-screen
-resources (fonts, particles, floating text, screen shake, background tint
-and an optional audio hook).
-
-The duel state runs each round as a phase pipeline::
-
-    countdown -> choose -> resolve (travel -> impact -> reveal) -> next round
-                                                                 or -> result
-
-The AI commits its choice the moment the choose phase begins, which is what
-lets the hint power-up honestly reveal the category of the choice the AI
-has already locked in.
-"""
-
-from __future__ import annotations
-
-import math
-import random
-from collections.abc import Callable
-from typing import Any
-
 import pygame
-
-import config
-from ai_opponent import AIOpponent, element_category
-from game_logic import Match, affordable_choices
+import random
+import math
+from config import ELEMENTS, RULES, WIDTH, HEIGHT, ENERGY_REGEN, POWER_UP_SPAWN_INTERVAL
+from theme import get_font, ELEMENT_THEMES, BG_DARK, BG_PANEL, BG_PANEL_HOVER, TEXT_LIGHT, TEXT_MUTED, ACCENT_PRIMARY, ACCENT_SECONDARY, ACCENT_SUCCESS, ACCENT_DANGER, ACCENT_WARNING
+from ui import Button, Bar, draw_gradient_rect, draw_glow_circle, draw_element_icon, ease_out_cubic
+from game_logic import GameSession
+from ai_opponent import AIOpponent
+from power_ups import PowerUp
 from particle_system import ParticleSystem
-from power_ups import POWERUP_TITLES, PowerUpManager
-from ui import (
-    Bar,
-    Button,
-    Countdown,
-    ElementButton,
-    FloatingTextManager,
-    build_element_buttons,
-    draw_rules_help,
-    draw_text,
-    lerp,
-    lerp_color,
-    load_fonts,
-)
 
+class BackgroundParticle:
+    def __init__(self):
+        self.x = random.randint(0, WIDTH)
+        self.y = random.randint(0, HEIGHT)
+        self.size = random.uniform(1, 3)
+        self.speed = random.uniform(0.2, 1.0)
+        self.alpha = random.randint(50, 180)
 
-def ease_in_quad(t: float) -> float:
-    """Accelerating ease used for the choice-impact collision."""
-    return t * t
+    def update(self):
+        self.y += self.speed
+        if self.y > HEIGHT:
+            self.y = 0
+            self.x = random.randint(0, WIDTH)
 
-
-class AppState:
-    """Base class for one screen.
-
-    Attributes:
-        game: Shared context (fonts, particles, shake, audio, machine).
-    """
-
-    def __init__(self, game: Game) -> None:
-        """Attach the state to its shared game context."""
-        self.game = game
-
-    def enter(self, **params: Any) -> None:
-        """Called right after the state becomes current; params vary per state."""
-
-    def handle_event(self, event: pygame.event.Event) -> None:
-        """Process one pygame event."""
-
-    def update(self, dt: float) -> None:
-        """Advance the state by ``dt`` seconds."""
-
-    def draw(self, surface: pygame.Surface, offset: tuple[float, float]) -> None:
-        """Draw the screen; ``offset`` is the screen-shake shift for world items."""
-
-
-# ---------------------------------------------------------------------------
-# Shared context
-# ---------------------------------------------------------------------------
-
-
-class Game:
-    """Shared context threaded through every state.
-
-    Owns the fonts, particle system, floating text manager, screen shake,
-    background tint, the state machine itself and an optional audio hook
-    exposing ``play(name)`` (headless tests pass ``None``).
-    """
-
-    def __init__(
-        self,
-        fonts: dict[str, Any] | None = None,
-        audio: Any | None = None,
-        rng: random.Random | None = None,
-    ) -> None:
-        """Create the context; ``fonts`` loads lazily when omitted."""
-        self.fonts = fonts if fonts is not None else load_fonts()
-        self.audio = audio
-        self.rng = rng if rng is not None else random.Random()
-        self.particles = ParticleSystem(self.rng)
-        self.floating = FloatingTextManager(self.fonts["h2"])
-        self.machine = StateMachine(self)
-
-        # Screen shake state.
-        self.shake_time_left = 0.0
-        self.shake_duration = 0.0
-        self.shake_magnitude = 0.0
-        self.shake_offset: tuple[float, float] = (0.0, 0.0)
-
-        # Background tint follows the dominant element of recent rounds.
-        self.tint_color: tuple[float, float, float] = tuple(config.BACKGROUND)
-
-        # Register the screens.
-        self.machine.register("menu", MenuState(self))
-        self.machine.register("mode", ModeSelectState(self))
-        self.machine.register("help", HelpState(self))
-        self.machine.register("game", GameState(self))
-        self.machine.register("result", ResultState(self))
-        self.machine.change_state("menu", immediate=True)
-
-    # -- Effects -------------------------------------------------------------
-
-    def shake(self, duration: float, magnitude: float) -> None:
-        """Start (or re-arm) a screen shake."""
-        self.shake_time_left = duration
-        self.shake_duration = duration
-        self.shake_magnitude = magnitude
-
-    def tint_toward(self, element: str | None) -> None:
-        """Retarget the background tint at an element's identity color."""
-        if element is None:
-            self._tint_target = tuple(config.BACKGROUND)
-        else:
-            self._tint_target = lerp_color(
-                config.BACKGROUND, config.ELEMENT_COLORS[element], config.BACKGROUND_TINT_STRENGTH
-            )
-
-    _tint_target: tuple[float, float, float] = tuple(config.BACKGROUND)
-
-    def play_sound(self, name: str) -> None:
-        """Play a named sound if an audio hook is installed."""
-        if self.audio is not None:
-            self.audio.play(name)
-
-    def match_or_none(self) -> Match | None:
-        """The live match object when the duel state owns one, else ``None``."""
-        game_state = self.machine.states.get("game")
-        match = getattr(game_state, "match", None)
-        return match if isinstance(match, Match) else None
-
-    # -- Frame drivers -------------------------------------------------------
-
-    def handle_event(self, event: pygame.event.Event) -> None:
-        """Forward events to the current state."""
-        self.machine.current.handle_event(event)
-
-    def update(self, dt: float) -> None:
-        """Advance shake, tint, particles, floating text and the current state."""
-        if self.shake_time_left > 0.0:
-            self.shake_time_left = max(0.0, self.shake_time_left - dt)
-            remaining = self.shake_time_left / max(self.shake_duration, 0.0001)
-            magnitude = self.shake_magnitude * remaining
-            self.shake_offset = (
-                self.rng.uniform(-magnitude, magnitude),
-                self.rng.uniform(-magnitude, magnitude),
-            )
-        else:
-            self.shake_offset = (0.0, 0.0)
-        self.tint_color = tuple(
-            lerp(current, target, min(1.0, config.BAR_LERP_SPEED * dt))
-            for current, target in zip(self.tint_color, self._tint_target, strict=True)
-        )
-        self.machine.update(dt)
-        self.particles.update(dt)
-        self.floating.update(dt)
-
-    def draw(self, surface: pygame.Surface) -> None:
-        """Render the tinted background, the current state and top effects."""
-        background = tuple(int(channel) for channel in self.tint_color)
-        surface.fill(background)
-        self.machine.current.draw(surface, self.shake_offset)
-        self.particles.draw(surface, self.shake_offset)
-        self.floating.draw(surface)
-        self.machine.draw_transition(surface)
-
-
-# ---------------------------------------------------------------------------
-# State machine with fade transitions
-# ---------------------------------------------------------------------------
+    def draw(self, surface):
+        s = pygame.Surface((int(self.size * 2), int(self.size * 2)), pygame.SRCALPHA)
+        pygame.draw.circle(s, (255, 255, 255, self.alpha), (int(self.size), int(self.size)), int(self.size))
+        surface.blit(s, (self.x, self.y))
 
 
 class StateMachine:
-    """Swaps between states behind a short fade-to-dark transition."""
+    def __init__(self):
+        self.states = {}
+        self.current_state = None
 
-    def __init__(self, game: Game) -> None:
-        """Create the machine; states register themselves by name."""
-        self.game = game
-        self.states: dict[str, AppState] = {}
-        self.current: AppState | None = None
-        self._pending: str | None = None
-        self._pending_params: dict[str, Any] = {}
-        self._fade_phase: str | None = None  # "out" | "in" | None
-        self._fade_t = 0.0
-
-    def register(self, name: str, state: AppState) -> None:
-        """Add a state under ``name``."""
+    def add_state(self, name, state):
         self.states[name] = state
 
-    def change_state(self, name: str, immediate: bool = False, **params: Any) -> None:
-        """Request a state change.
+    def change_state(self, name, **kwargs):
+        if self.current_state:
+            self.current_state.exit()
+        self.current_state = self.states.get(name)
+        if self.current_state:
+            # Ensure enter method is called with kwargs
+            self.current_state.enter(**kwargs)
 
-        Args:
-            name: Registered state name.
-            immediate: Skip the fade (used for the initial state).
-            **params: Forwarded to the new state's ``enter``.
-        """
-        self._pending = name
-        self._pending_params = params
-        if immediate:
-            self._commit_change()
-            self._fade_phase = None
-            self._fade_t = 0.0
-        else:
-            self._fade_phase = "out"
-            self._fade_t = 0.0
+    def handle_event(self, event):
+        if self.current_state:
+            self.current_state.handle_event(event)
 
-    def _commit_change(self) -> None:
-        """Swap in the pending state and call its ``enter``."""
-        assert self._pending is not None
-        self.current = self.states[self._pending]
-        self.current.enter(**self._pending_params)
-        self._pending = None
-        self._pending_params = {}
+    def update(self):
+        if self.current_state:
+            self.current_state.update()
 
-    @property
-    def transitioning(self) -> bool:
-        """Whether a fade is currently running."""
-        return self._fade_phase is not None
-
-    def update(self, dt: float) -> None:
-        """Advance the fade and the current state.
-
-        Input is intentionally not blocked for long: the fade is brief
-        (``config.TRANSITION_SECONDS`` per phase) and state logic keeps
-        running during it.
-        """
-        if self._fade_phase == "out":
-            self._fade_t += dt
-            if self._fade_t >= config.TRANSITION_SECONDS:
-                self._commit_change()
-                self._fade_phase = "in"
-                self._fade_t = 0.0
-        elif self._fade_phase == "in":
-            self._fade_t += dt
-            if self._fade_t >= config.TRANSITION_SECONDS:
-                self._fade_phase = None
-                self._fade_t = 0.0
-        if self.current is not None:
-            self.current.update(dt)
-
-    def draw_transition(self, surface: pygame.Surface) -> None:
-        """Draw the fade overlay for the current phase."""
-        if self._fade_phase is None:
-            return
-        progress = min(1.0, self._fade_t / config.TRANSITION_SECONDS)
-        alpha = int(255 * (progress if self._fade_phase == "out" else 1.0 - progress))
-        overlay = pygame.Surface(surface.get_size(), pygame.SRCALPHA)
-        overlay.fill((*config.BACKGROUND_ALT, alpha))
-        surface.blit(overlay, (0, 0))
+    def draw(self, surface):
+        if self.current_state:
+            self.current_state.draw(surface)
 
 
-# ---------------------------------------------------------------------------
-# Menu
-# ---------------------------------------------------------------------------
+class BaseState:
+    def __init__(self, machine):
+        self.machine = machine
+        self.bg_particles = [BackgroundParticle() for _ in range(60)]
+
+    def enter(self, **kwargs):
+        """Called when the state is entered."""
+        pass
+
+    def exit(self):
+        """Called when the state is exited."""
+        pass
+
+    def update(self):
+        """Updates the state logic."""
+        pass
+
+    def handle_event(self, event):
+        """Handles pygame events."""
+        pass
+
+    def draw(self, surface):
+        """Draws the state to the surface."""
+        pass
+
+    def update_bg(self):
+        for p in self.bg_particles:
+            p.update()
+
+    def draw_bg(self, surface):
+        surface.fill(BG_DARK)
+        for p in self.bg_particles:
+            p.draw(surface)
 
 
-class MenuState(AppState):
-    """Title screen with Play, How to Play and Quit."""
+class MenuState(BaseState):
+    def __init__(self, machine):
+        super().__init__(machine)
+        self.title_font = get_font(64, bold=True)
+        self.subtitle_font = get_font(24)
+        self.play_btn = Button(WIDTH // 2 - 150, HEIGHT // 2 - 20, 300, 70, "Start Game", font=get_font(28, bold=True))
+        self.help_btn = Button(WIDTH // 2 - 150, HEIGHT // 2 + 70, 300, 70, "How to Play", font=get_font(28, bold=True))
+        self.quit_btn = Button(WIDTH // 2 - 150, HEIGHT // 2 + 160, 300, 70, "Exit Game", font=get_font(28, bold=True))
 
-    def __init__(self, game: Game) -> None:
-        """Build the menu buttons from the shared fonts."""
-        super().__init__(game)
-        self.time = 0.0
-        center_x = config.WINDOW_WIDTH / 2
-        button_width, button_height = 320, config.BUTTON_HEIGHT
-        self.play_button = Button(
-            pygame.Rect(0, 0, button_width, button_height),
-            "Play",
-            self.game.fonts["h2"],
-        )
-        self.help_button = Button(
-            pygame.Rect(0, 0, button_width, button_height),
-            "How to Play",
-            self.game.fonts["h2"],
-        )
-        self.quit_button = Button(
-            pygame.Rect(0, 0, button_width, button_height),
-            "Quit",
-            self.game.fonts["h2"],
-        )
-        y = config.WINDOW_HEIGHT * 0.52
-        for button in (self.play_button, self.help_button, self.quit_button):
-            button.rect.center = (center_x, y)
-            y += button_height + 18
+    def handle_event(self, event):
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            pos = event.pos
+            if self.play_btn.update(pos, True):
+                self.machine.change_state("mode_select")
+            elif self.help_btn.update(pos, True):
+                self.machine.change_state("help")
+            elif self.quit_btn.update(pos, True):
+                pygame.quit()
+                import sys
+                sys.exit(0)
 
-    def handle_event(self, event: pygame.event.Event) -> None:
-        """Commit menu choices on click."""
-        if self.play_button.handle_event(event):
-            self.game.play_sound("click")
-            self.game.machine.change_state("mode")
-        elif self.help_button.handle_event(event):
-            self.game.play_sound("click")
-            self.game.machine.change_state("help", return_to="menu")
-        elif self.quit_button.handle_event(event):
-            pygame.event.post(pygame.event.Event(pygame.QUIT))
+    def update(self):
+        self.update_bg()
+        pos = pygame.mouse.get_pos()
+        self.play_btn.update(pos, False)
+        self.help_btn.update(pos, False)
+        self.quit_btn.update(pos, False)
 
-    def update(self, dt: float) -> None:
-        """Advance the title pulse and button hover states."""
-        self.time += dt
-        for button in (self.play_button, self.help_button, self.quit_button):
-            button.update(dt)
+    def draw(self, surface):
+        self.draw_bg(surface)
 
-    def draw(self, surface: pygame.Surface, offset: tuple[float, float]) -> None:
-        """Render the pulsing title and menu buttons."""
-        pulse = 1.0 + 0.03 * math.sin(self.time * 2.0)
-        title = self.game.fonts["title"].render("ELEMENTAL RPS", True, config.TEXT)
-        size = (int(title.get_width() * pulse), int(title.get_height() * pulse))
-        scaled = pygame.transform.smoothscale(title, size)
-        surface.blit(scaled, scaled.get_rect(center=(config.WINDOW_WIDTH / 2, config.WINDOW_HEIGHT * 0.22)))
-        draw_text(
-            surface,
-            "Rock - Paper - Scissors - Fire - Water - Earth",
-            self.game.fonts["body"],
-            config.TEXT_DIM,
-            center=(config.WINDOW_WIDTH / 2, config.WINDOW_HEIGHT * 0.36),
-        )
-        for button in (self.play_button, self.help_button, self.quit_button):
-            button.draw(surface)
+        draw_glow_circle(surface, (WIDTH // 2 + 100, HEIGHT // 2 - 200), 180, ACCENT_PRIMARY, intensity=5)
+        draw_glow_circle(surface, (WIDTH // 2 - 200, HEIGHT // 2 + 180), 140, ACCENT_SECONDARY, intensity=4)
+
+        title = self.title_font.render("Elemental Arena", True, TEXT_LIGHT)
+        subtitle = self.subtitle_font.render("The Ultimate RPS Experience", True, TEXT_MUTED)
+
+        surface.blit(title, title.get_rect(center=(WIDTH // 2, HEIGHT // 2 - 140)))
+        surface.blit(subtitle, subtitle.get_rect(center=(WIDTH // 2, HEIGHT // 2 - 90)))
+
+        self.play_btn.draw(surface)
+        self.help_btn.draw(surface)
+        self.quit_btn.draw(surface)
 
 
-# ---------------------------------------------------------------------------
-# Mode select
-# ---------------------------------------------------------------------------
+class ModeSelectState(BaseState):
+    def __init__(self, machine):
+        super().__init__(machine)
+        self.font = get_font(38, bold=True)
+        self.btn_bo3 = Button(WIDTH // 2 - 200, HEIGHT // 2 - 60, 400, 70, "Best of 3 Rounds", font=get_font(28, bold=True))
+        self.btn_bo5 = Button(WIDTH // 2 - 200, HEIGHT // 2 + 30, 400, 70, "Best of 5 Rounds", font=get_font(28, bold=True))
+        self.btn_back = Button(WIDTH // 2 - 200, HEIGHT // 2 + 150, 400, 60, "Back to Menu", font=get_font(24, bold=True))
+
+    def handle_event(self, event):
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            pos = event.pos
+            if self.btn_bo3.update(pos, True):
+                self.machine.change_state("battle", best_of=3)
+            elif self.btn_bo5.update(pos, True):
+                self.machine.change_state("battle", best_of=5)
+            elif self.btn_back.update(pos, True):
+                self.machine.change_state("menu")
+
+    def update(self):
+        self.update_bg()
+        pos = pygame.mouse.get_pos()
+        self.btn_bo3.update(pos, False)
+        self.btn_bo5.update(pos, False)
+        self.btn_back.update(pos, False)
+
+    def draw(self, surface):
+        self.draw_bg(surface)
+        title = self.font.render("Select Match Mode", True, TEXT_LIGHT)
+        surface.blit(title, title.get_rect(center=(WIDTH // 2, HEIGHT // 2 - 150)))
+
+        self.btn_bo3.draw(surface)
+        self.btn_bo5.draw(surface)
+        self.btn_back.draw(surface)
 
 
-class ModeSelectState(AppState):
-    """Choose Best-of-3 / 5 / 7 before entering the duel."""
+class HelpState(BaseState):
+    def __init__(self, machine):
+        super().__init__(machine)
+        self.title_font = get_font(40, bold=True)
+        self.element_name_font = get_font(24, bold=True)
+        self.rule_text_font = get_font(16)
+        self.back_btn = Button(WIDTH // 2 - 180, HEIGHT - 80, 360, 60, "Back to Menu", font=get_font(24, bold=True))
 
-    def __init__(self, game: Game) -> None:
-        """Build one button per configured best-of option plus Back."""
-        super().__init__(game)
-        self.buttons: list[tuple[int, Button]] = []
-        button_width = 260
-        spacing = 40
-        total = len(config.BEST_OF_OPTIONS) * button_width + (len(config.BEST_OF_OPTIONS) - 1) * spacing
-        x = (config.WINDOW_WIDTH - total) / 2 + button_width / 2
-        for option in config.BEST_OF_OPTIONS:
-            button = Button(
-                pygame.Rect(0, 0, button_width, config.BUTTON_HEIGHT + 14),
-                f"Best of {option}",
-                self.game.fonts["h2"],
-            )
-            button.rect.center = (x, config.WINDOW_HEIGHT * 0.5)
-            self.buttons.append((option, button))
-            x += button_width + spacing
-        self.back_button = Button(pygame.Rect(0, 0, 180, config.BUTTON_HEIGHT), "Back", self.game.fonts["body"])
-        self.back_button.rect.center = (config.WINDOW_WIDTH / 2, config.WINDOW_HEIGHT * 0.78)
+        self.element_cards = []
+        card_w, card_h = 280, 180
+        start_x = (WIDTH - (3 * (card_w + 30))) // 2
+        start_y = 120
+        for i, elem in enumerate(ELEMENTS):
+            x = start_x + (i % 3) * (card_w + 30)
+            y = start_y + (i // 3) * (card_h + 30)
+            self.element_cards.append({"element": elem, "rect": pygame.Rect(x, y, card_w, card_h), "hovered": False})
 
-    def handle_event(self, event: pygame.event.Event) -> None:
-        """Start a match of the chosen length, or go back."""
-        for option, button in self.buttons:
-            if button.handle_event(event):
-                self.game.play_sound("click")
-                self.game.machine.change_state("game", best_of=option)
-                return
-        if self.back_button.handle_event(event):
-            self.game.play_sound("click")
-            self.game.machine.change_state("menu")
+        self.hover_element = None
 
-    def update(self, dt: float) -> None:
-        """Refresh hover states."""
-        for _, button in self.buttons:
-            button.update(dt)
-        self.back_button.update(dt)
+    def handle_event(self, event):
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            if self.back_btn.update(event.pos, True):
+                self.machine.change_state("menu")
 
-    def draw(self, surface: pygame.Surface, offset: tuple[float, float]) -> None:
-        """Render the prompt and the option buttons."""
-        draw_text(
-            surface,
-            "Choose your battle",
-            self.game.fonts["h1"],
-            config.TEXT,
-            center=(config.WINDOW_WIDTH / 2, config.WINDOW_HEIGHT * 0.28),
-        )
-        draw_text(
-            surface,
-            "First side to run out of HP loses - higher HP wins if rounds run out.",
-            self.game.fonts["small"],
-            config.TEXT_DIM,
-            center=(config.WINDOW_WIDTH / 2, config.WINDOW_HEIGHT * 0.38),
-        )
-        for _, button in self.buttons:
-            button.draw(surface)
-        self.back_button.draw(surface)
+    def update(self):
+        self.update_bg()
+        mouse_pos = pygame.mouse.get_pos()
+        self.back_btn.update(mouse_pos, False)
 
+        self.hover_element = None
+        for card in self.element_cards:
+            card["hovered"] = card["rect"].collidepoint(mouse_pos)
+            if card["hovered"]:
+                self.hover_element = card["element"]
 
-# ---------------------------------------------------------------------------
-# Help
-# ---------------------------------------------------------------------------
+    def draw(self, surface):
+        self.draw_bg(surface)
+        title = self.title_font.render("Elemental Rules & Guide", True, TEXT_LIGHT)
+        surface.blit(title, title.get_rect(center=(WIDTH // 2, 50)))
 
+        for card_data in self.element_cards:
+            elem = card_data["element"]
+            rect = card_data["rect"]
+            is_hovered = card_data["hovered"]
 
-class HelpState(AppState):
-    """The full rules table; returns to wherever it was opened from."""
+            theme = ELEMENT_THEMES[elem]
+            bg_top = theme["primary"]
+            bg_bot = theme["gradient"]
 
-    def __init__(self, game: Game) -> None:
-        """Create the back button; ``return_to`` defaults to the menu."""
-        super().__init__(game)
-        self.return_to = "menu"
-        self.back_button = Button(pygame.Rect(0, 0, 180, config.BUTTON_HEIGHT), "Back", self.game.fonts["body"])
-        self.back_button.rect.center = (config.WINDOW_WIDTH / 2, config.WINDOW_HEIGHT - 38)
+            draw_gradient_rect(surface, rect, bg_top, bg_bot, radius=15)
+            border_color = theme["glow"] if is_hovered else (71, 85, 105)
+            pygame.draw.rect(surface, border_color, rect, width=2, border_radius=15)
 
-    def enter(self, return_to: str = "menu", **_: Any) -> None:
-        """Remember which screen to return to."""
-        self.return_to = return_to
+            name_surf = self.element_name_font.render(RULES[elem]["name"], True, TEXT_LIGHT)
+            surface.blit(name_surf, name_surf.get_rect(center=(rect.centerx, rect.y + 35)))
+            draw_element_icon(surface, elem, (rect.centerx, rect.y + 85), 35, is_enabled=True)
 
-    def handle_event(self, event: pygame.event.Event) -> None:
-        """Back on click, Esc or H."""
-        if self.back_button.handle_event(event):
-            self.game.play_sound("click")
-            self.game.machine.change_state(self.return_to)
-        elif event.type == pygame.KEYDOWN and event.key in (pygame.K_ESCAPE, pygame.K_h):
-            self.game.machine.change_state(self.return_to)
+            if self.hover_element == elem:
+                beats = ", ".join([RULES[b]["name"] for b in RULES[elem]["beats"]])
+                loses = ", ".join([RULES[l]["name"] for l in RULES[elem]["loses_to"]])
 
-    def update(self, dt: float) -> None:
-        """Refresh hover state."""
-        self.back_button.update(dt)
+                beats_surf = self.rule_text_font.render(f"BEATS: {beats}", True, ACCENT_SUCCESS)
+                loses_surf = self.rule_text_font.render(f"LOSES: {loses}", True, ACCENT_DANGER)
 
-    def draw(self, surface: pygame.Surface, offset: tuple[float, float]) -> None:
-        """Render the rules table and back button."""
-        draw_rules_help(surface, self.game.fonts)
-        self.back_button.draw(surface)
+                surface.blit(beats_surf, beats_surf.get_rect(center=(rect.centerx, rect.y + 130)))
+                surface.blit(loses_surf, loses_surf.get_rect(center=(rect.centerx, rect.y + 155)))
+
+        self.back_btn.draw(surface)
 
 
-# ---------------------------------------------------------------------------
-# The duel
-# ---------------------------------------------------------------------------
+class BattleState(BaseState):
+    def __init__(self, machine):
+        super().__init__(machine)
+        self.session = None
+        self.ai = AIOpponent()
+        self.particles = ParticleSystem()
+        self.power_ups = []
+        self.active_power_up_buffs = {}
+        self.round_count = 0
 
+        self.p_hp_bar = Bar(50, 30, 350, 28, 100, ACCENT_SUCCESS, bg_color=(20, 27, 45))
+        self.ai_hp_bar = Bar(WIDTH - 400, 30, 350, 28, 100, ACCENT_DANGER, bg_color=(20, 27, 45))
+        self.p_energy_bar = Bar(50, 70, 350, 20, 100, ACCENT_PRIMARY, bg_color=(20, 27, 45))
+        self.ai_energy_bar = Bar(WIDTH - 400, 70, 350, 20, 100, ACCENT_WARNING, bg_color=(20, 27, 45))
 
-class GameState(AppState):
-    """The duel itself: countdown, choosing, resolution and round flow."""
+        self.selected_choice = None
+        self.ai_choice_display = None
+        self.result_display_text = ""
+        self.result_color = TEXT_LIGHT
+        self.result_timer = 0
+        self.hint_text = ""
 
-    def __init__(self, game: Game) -> None:
-        """Pre-build bars, buttons and helpers; ``start_match`` initializes a match."""
-        super().__init__(game)
-        self.best_of = config.DEFAULT_BEST_OF
-        self.match: Match | None = None
-        self.ai = AIOpponent(self.game.rng)
-        self.powerups: PowerUpManager | None = None
+        self.clash_animation_start_time = 0
+        self.clash_duration = 900  # ms
 
-        self.phase = "countdown"
-        self._resolve_t = 0.0
-        self._reveal_started = False
-        self._impact_done = False
-        self._done_t = 0.0
-        self._result_requested = False
-        self.result: Any | None = None
-        self.ai_choice: str | None = None
-        self._countdown_step_seen: str | None = None
-        self.player_max_combo = 0
+    def enter(self, best_of=3):
+        self.session = GameSession(best_of=best_of)
+        self.ai = AIOpponent()
+        self.particles = ParticleSystem()
+        self.power_ups = []
+        self.active_power_up_buffs = {}
+        self.selected_choice = None
+        self.ai_choice_display = None
+        self.result_display_text = ""
+        self.hint_text = ""
+        self.round_count = 0
 
-        self.countdown = Countdown(self.game.fonts["h1"], (config.WINDOW_WIDTH / 2, config.WINDOW_HEIGHT * 0.30))
+        self.p_hp_bar.set_value(self.session.player_hp)
+        self.ai_hp_bar.set_value(self.session.ai_hp)
+        self.p_energy_bar.set_value(self.session.player_energy)
+        self.ai_energy_bar.set_value(self.session.ai_energy)
 
-        # Bars: HP on top, energy underneath, mirrored for both sides.
-        bar_width, bar_height = 380, 24
-        self.player_hp_bar = Bar(
-            pygame.Rect(48, 34, bar_width, bar_height),
-            config.MAX_HP,
-            config.PLAYER_COLOR,
-            label="HP",
-            font=self.game.fonts["small"],
-        )
-        self.player_energy_bar = Bar(
-            pygame.Rect(48, 66, bar_width - 40, 14),
-            config.MAX_ENERGY,
-            config.ACCENT,
-            label="EN",
-            font=self.game.fonts["small"],
-            start_value=config.STARTING_ENERGY,
-        )
-        self.ai_hp_bar = Bar(
-            pygame.Rect(config.WINDOW_WIDTH - 48 - bar_width, 34, bar_width, bar_height),
-            config.MAX_HP,
-            config.AI_COLOR,
-            label="HP",
-            font=self.game.fonts["small"],
-        )
-        self.ai_energy_bar = Bar(
-            pygame.Rect(config.WINDOW_WIDTH - 48 - (bar_width - 40), 66, bar_width - 40, 14),
-            config.MAX_ENERGY,
-            config.WARNING,
-            label="EN",
-            font=self.game.fonts["small"],
-            start_value=config.STARTING_ENERGY,
-        )
+    def handle_event(self, event):
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            pos = event.pos
 
-        self.element_buttons: list[ElementButton] = build_element_buttons(
-            self.game.fonts["body"], self.game.fonts["small"]
-        )
-        self._hotkeys = {str(index + 1): button.element for index, button in enumerate(self.element_buttons)}
-
-        # Choice tokens flying toward the center during resolution.
-        self._token_travel = config.CHOICE_TRAVEL_SECONDS
-        self._player_token_pos = (90.0, config.WINDOW_HEIGHT * 0.42)
-        self._ai_token_pos = (config.WINDOW_WIDTH - 90.0, config.WINDOW_HEIGHT * 0.42)
-        self._center = (config.WINDOW_WIDTH / 2, config.WINDOW_HEIGHT * 0.40)
-
-    # -- Lifecycle -----------------------------------------------------------
-
-    def enter(self, best_of: int | None = None, **_: Any) -> None:
-        """Start (or restart) a match of ``best_of`` rounds."""
-        self.start_match(best_of if best_of is not None else self.best_of)
-
-    def start_match(self, best_of: int) -> None:
-        """Reset every piece of match state for a fresh duel."""
-        self.best_of = best_of
-        self.match = Match(best_of)
-        self.ai.reset()
-        self.powerups = PowerUpManager(self.match, self._ai_category_provider, self.game.rng)
-        self.phase = "countdown"
-        self.countdown.restart()
-        self.result = None
-        self.ai_choice = None
-        self._resolve_t = 0.0
-        self._reveal_started = False
-        self._impact_done = False
-        self._done_t = 0.0
-        self._result_requested = False
-        self.player_max_combo = 0
-        self.game.particles.clear()
-        self.game.floating.clear()
-        self.game.tint_toward(None)
-        for bar, value in (
-            (self.player_hp_bar, config.MAX_HP),
-            (self.player_energy_bar, config.STARTING_ENERGY),
-            (self.ai_hp_bar, config.MAX_HP),
-            (self.ai_energy_bar, config.STARTING_ENERGY),
-        ):
-            bar.display = float(value)
-            bar.set_target(value)
-
-    def _ai_category_provider(self) -> str:
-        """Category of the AI's committed choice; used by the hint power-up."""
-        return element_category(self.ai_choice) if self.ai_choice is not None else "classic"
-
-    # -- Input ---------------------------------------------------------------
-
-    def handle_event(self, event: pygame.event.Event) -> None:
-        """Route clicks/keys to buttons, power-ups and choices."""
-        if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
-            self.game.machine.change_state("menu")
-            return
-        if event.type == pygame.KEYDOWN and event.key == pygame.K_h:
-            self.game.machine.change_state("help", return_to="game")
-            return
-        if self.match is None:
-            return
-
-        if self.powerups is not None:
-            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                if self.powerups.try_claim(event.pos):
-                    self.game.play_sound("powerup")
-                    if self.powerups.last_pickup is not None:
-                        self.game.floating.spawn(
-                            self.powerups.last_pickup,
-                            (config.WINDOW_WIDTH / 2 - 80, config.WINDOW_HEIGHT * 0.20),
-                            config.SUCCESS,
-                        )
+            for pu in self.power_ups[:]:
+                if pu.is_clicked(pos):
+                    self.apply_power_up(pu.type)
+                    self.power_ups.remove(pu)
                     return
-            # "E" activates whichever power-up is on screen; the digits
-            # 1-6 stay reserved for element choices.
-            elif event.type == pygame.KEYDOWN and event.unicode.lower() == "e" and self.powerups.claim_by_hotkey():
-                self.game.play_sound("powerup")
+
+            if self.result_display_text != "":
                 return
 
-        if self.phase == "choose":
-            for button in self.element_buttons:
-                if button.handle_event(event):
-                    self._player_picked(button.element)
-                    return
-            if event.type == pygame.KEYDOWN and event.unicode in self._hotkeys:
-                self._player_picked(self._hotkeys[event.unicode])
+            card_w, card_h = 150, 160
+            start_x = (WIDTH - (6 * 165)) // 2
+            y = HEIGHT - 190
 
-    def _player_picked(self, element: str) -> None:
-        """Commit the player's choice and start the resolution pipeline."""
-        assert self.match is not None and self.ai_choice is not None
-        self.result = self.match.play_round(element, self.ai_choice)
-        self.ai.observe(element)
-        self.phase = "resolve"
-        self._resolve_t = 0.0
-        self._reveal_started = False
-        self._impact_done = False
-        self.game.play_sound("throw")
+            for i, elem in enumerate(ELEMENTS):
+                cx = start_x + i * 165
+                rect = pygame.Rect(cx, y, card_w, card_h)
+                if rect.collidepoint(pos):
+                    if self.session.can_afford(elem):
+                        self.execute_round(elem)
+                    else:
+                        self.hint_text = "Not enough energy for this element!"
+                    break
 
-    # -- Simulation ----------------------------------------------------------
+    def apply_power_up(self, pu_type):
+        if pu_type == "double_damage":
+            self.active_power_up_buffs['player_double_damage'] = True
+            self.hint_text = "Power-up Activated: Double Damage next round!"
+        elif pu_type == "full_energy":
+            self.session.player_energy = 100
+            self.hint_text = "Power-up Activated: Full Energy Restored!"
+        elif pu_type == "shield":
+            self.active_power_up_buffs['player_shield'] = True
+            self.hint_text = "Power-up Activated: One-time Shield!"
+        elif pu_type == "hint":
+            h = self.ai.get_hint()
+            self.hint_text = f"AI Hint: Next move is a {h.upper()} element."
 
-    def update(self, dt: float) -> None:
-        """Advance the phase pipeline and every animated widget."""
-        if self.match is None:
-            return
-        match = self.match
+    def execute_round(self, player_choice):
+        self.round_count += 1
+        self.selected_choice = player_choice
+        ai_choice = self.ai.choose_move(self.session.ai_energy)
+        self.ai.record_player_choice(player_choice)
 
-        # Bars always chase the true values.
-        self.player_hp_bar.set_target(match.player.hp)
-        self.player_energy_bar.set_target(match.player.energy)
-        self.ai_hp_bar.set_target(match.opponent.hp)
-        self.ai_energy_bar.set_target(match.opponent.energy)
-        for button in self.element_buttons:
-            button.update(dt)
-        self.player_hp_bar.update(dt)
-        self.player_energy_bar.update(dt)
-        self.ai_hp_bar.update(dt)
-        self.ai_energy_bar.update(dt)
-        self.player_max_combo = max(self.player_max_combo, match.player.combo)
+        res = self.session.process_round(player_choice, ai_choice, self.active_power_up_buffs)
+        self.ai_choice_display = ai_choice
 
-        # Energy gating lives in update (not draw) so it stays testable:
-        # unaffordable choices grey out while the player may act.
-        if self.phase == "choose":
-            affordable = set(affordable_choices(match.player))
-            for button in self.element_buttons:
-                button.set_affordable(button.element in affordable)
+        if res["result"] == 'win':
+            self.result_display_text = f"VICTORY! +{res['player_dmg']} DMG"
+            self.result_color = ACCENT_SUCCESS
+            self.session.player_wins += 1
+            self.particles.emit(WIDTH // 2, HEIGHT // 2, player_choice, count=40)
+        elif res["result"] == 'lose':
+            if res["shield_used"]:
+                self.result_display_text = "SHIELD BLOCKED DAMAGE!"
+                self.result_color = ACCENT_PRIMARY
+            else:
+                self.result_display_text = f"DEFEAT! -{res['ai_dmg']} DMG"
+                self.result_color = ACCENT_DANGER
+            self.session.ai_wins += 1
+            self.particles.emit(WIDTH // 2, HEIGHT // 2, ai_choice, count=40)
         else:
-            for button in self.element_buttons:
-                button.enabled = True
+            self.result_display_text = "ROUND TIE!"
+            self.result_color = ACCENT_WARNING
+            self.particles.emit(WIDTH // 2, HEIGHT // 2, "paper", count=20) # Neutral particles for tie
 
-        if self.phase == "countdown":
-            self.countdown.update(dt)
-            label = self.countdown.label()
-            if label != self._countdown_step_seen:
-                self._countdown_step_seen = label
-                if label is not None:
-                    self.game.play_sound("tick")
-            if self.countdown.finished:
-                self._begin_choose_phase()
-        elif self.phase == "choose":
-            pass  # wait for input; buttons handle their own hover
-        elif self.phase == "resolve":
-            self._update_resolve(dt)
-        elif self.phase == "done":
-            self._done_t += dt
-            if self._done_t >= config.TRANSITION_SECONDS and not self._result_requested:
-                self._result_requested = True  # request the swap exactly once
-                winner = match.winner()
-                self.game.machine.change_state(
-                    "result",
-                    winner=winner,
-                    rounds=match.rounds_played,
-                    best_of=self.best_of,
-                    max_combo=self.player_max_combo,
-                    player_hp=match.player.hp,
-                    ai_hp=match.opponent.hp,
-                )
+        if self.active_power_up_buffs.get('player_double_damage'):
+            self.active_power_up_buffs['player_double_damage'] = False
+        if res.get('shield_used'):
+            self.active_power_up_buffs['player_shield'] = False
 
-    def _begin_choose_phase(self) -> None:
-        """Open the choosing window: regen, power-up pacing, AI commitment."""
-        assert self.match is not None and self.powerups is not None
-        self.match.start_round()
-        self.powerups.on_round_started()
-        self.phase = "choose"
-        # The AI locks its move now, so the hint power-up stays honest.
-        self.ai_choice = self.ai.choose(tuple(affordable_choices(self.match.opponent)))
-        self._countdown_step_seen = None
+        self.clash_animation_start_time = pygame.time.get_ticks()
+        self.result_timer = pygame.time.get_ticks() + 2500
 
-    def _update_resolve(self, dt: float) -> None:
-        """Run travel -> impact -> reveal for the current round result."""
-        assert self.match is not None and self.result is not None
-        self._resolve_t += dt
-        impact_time = self._token_travel
-        reveal_time = impact_time + config.IMPACT_PAUSE_SECONDS
+        self.session.regenerate_energy(ENERGY_REGEN)
 
-        if not self._impact_done and self._resolve_t >= impact_time:
-            self._impact_done = True
-            self.game.particles.impact_burst(self._center)
-            self.game.shake(0.18, 5.0)
-            self.game.play_sound("clash")
-            self.game.tint_toward(self.result.player_choice if self.result.outcome != "lose" else self.result.ai_choice)
-        if self._reveal_started:
-            if self._resolve_t >= reveal_time + config.RESULT_DISPLAY_SECONDS:
-                if self.match.is_over():
-                    self.phase = "done"
-                    self._done_t = 0.0
-                else:
-                    self.phase = "countdown"
-                    self.countdown.restart()
-            return
-        if self._resolve_t >= reveal_time:
-            self._reveal_started = True
-            self._spawn_reveal_effects()
+        if self.round_count % POWER_UP_SPAWN_INTERVAL == 0 and random.random() < 0.6 and len(self.power_ups) < 2:
+            self.power_ups.append(PowerUp())
 
-    def _spawn_reveal_effects(self) -> None:
-        """Floating damage/combo text, themed bursts, shake and sounds."""
-        assert self.result is not None
-        result = self.result
-        if result.outcome != "tie":
-            loser_element = result.ai_choice if result.outcome == "win" else result.player_choice
-            burst_pos = self._ai_token_pos if result.outcome == "win" else self._player_token_pos
-            self.game.particles.burst_for_element(loser_element, burst_pos)
-        if result.outcome == "win":
-            self.game.play_sound("win")
-            if result.ai_damage_dealt > 0:
-                self.game.floating.spawn(
-                    f"-{result.ai_damage_dealt}", (self._center[0] + 40, self._center[1] - 30), config.SUCCESS
-                )
-            if result.player_combo >= 2:
-                self.game.floating.spawn(
-                    f"COMBO x{result.player_combo}", (self._center[0] - 160, self._center[1] - 70), config.WARNING
-                )
-        elif result.outcome == "lose":
-            self.game.play_sound("lose")
-            self.game.shake(config.SHAKE_DURATION_SECONDS, config.SHAKE_MAGNITUDE_PX)
-            if result.ai_damage_dealt > 0:
-                self.game.floating.spawn(
-                    f"-{result.ai_damage_dealt}", (self._center[0] - 120, self._center[1] - 30), config.DANGER
-                )
-        else:
-            self.game.play_sound("tie")
-            self.game.floating.spawn("TIE", (self._center[0] - 30, self._center[1] - 40), config.TEXT_DIM)
+    def update(self):
+        self.update_bg()
+        self.p_hp_bar.set_value(self.session.player_hp)
+        self.ai_hp_bar.set_value(self.session.ai_hp)
+        self.p_energy_bar.set_value(self.session.player_energy)
+        self.ai_energy_bar.set_value(self.session.ai_energy)
 
-    # -- Rendering -----------------------------------------------------------
+        self.p_hp_bar.update()
+        self.ai_hp_bar.update()
+        self.p_energy_bar.update()
+        self.ai_energy_bar.update()
+        self.particles.update()
 
-    def _draw_token(
-        self, surface: pygame.Surface, element: str, position: tuple[float, float], offset: tuple[float, float]
-    ) -> None:
-        """Draw one flying choice token as an element-colored disc with a glyph."""
-        radius = 46
-        center = (int(position[0] + offset[0]), int(position[1] + offset[1]))
-        color = config.ELEMENT_COLORS[element]
-        pygame.draw.circle(surface, color, center, radius)
-        pygame.draw.circle(surface, darken_for_token(color), center, radius, width=3)
-        glyph = self.game.fonts["h1"].render(GLYPHS[element], True, config.BACKGROUND)
-        surface.blit(glyph, glyph.get_rect(center=center))
+        for pu in self.power_ups[:]:
+            if not pu.update():
+                self.power_ups.remove(pu)
 
-    def draw(self, surface: pygame.Surface, offset: tuple[float, float]) -> None:
-        """Render the whole duel screen for the current phase."""
-        if self.match is None:
-            return
-        match = self.match
-        fonts = self.game.fonts
+        if self.result_display_text != "" and pygame.time.get_ticks() > self.result_timer:
+            self.result_display_text = ""
+            self.selected_choice = None
+            self.ai_choice_display = None
+            self.hint_text = ""
+            if self.session.is_match_over():
+                winner = self.session.get_match_winner()
+                self.machine.change_state("game_over", winner=winner, session=self.session)
 
-        # Top HUD: names, bars, round counter.
-        draw_text(surface, "YOU", fonts["h2"], config.PLAYER_COLOR, topleft=(48, 4))
-        draw_text(surface, "AI", fonts["h2"], config.AI_COLOR, topright=(config.WINDOW_WIDTH - 48, 4))
-        self.player_hp_bar.draw(surface)
-        self.player_energy_bar.draw(surface)
-        self.ai_hp_bar.draw(surface)
-        self.ai_energy_bar.draw(surface)
-        draw_text(
-            surface,
-            f"Round {min(match.round_number, self.best_of)} / {self.best_of}",
-            fonts["body"],
-            config.TEXT,
-            center=(config.WINDOW_WIDTH / 2, 40),
-        )
+    def draw(self, surface):
+        self.draw_bg(surface)
 
-        # Combo tracker under the player bars.
-        if match.player.combo >= 2:
-            draw_text(surface, f"COMBO x{match.player.combo}", fonts["body"], config.WARNING, topleft=(48, 92))
+        # Header HUD
+        self.p_hp_bar.draw(surface, "Your HP")
+        self.ai_hp_bar.draw(surface, "AI HP")
+        self.p_energy_bar.draw(surface, "Energy")
+        self.ai_energy_bar.draw(surface, "AI Energy")
 
-        # Active power-up bubble.
-        if self.powerups is not None and self.powerups.active is not None:
-            power_up = self.powerups.active
-            center = (int(power_up.position[0]), int(power_up.position[1]))
-            pulse = 1.0 + 0.08 * math.sin(pygame.time.get_ticks() / 180.0)
-            radius = int(config.POWERUP_RADIUS * pulse)
-            pygame.draw.circle(surface, config.WARNING, center, radius)
-            pygame.draw.circle(surface, darken_for_token(config.WARNING), center, radius, width=3)
-            draw_text(
-                surface,
-                POWERUP_TITLES[power_up.kind],
-                fonts["small"],
-                config.BACKGROUND,
-                center=(center[0], center[1] - 8),
-            )
-            draw_text(
-                surface,
-                f"[{power_up.hotkey}] {power_up.description()}",
-                fonts["tiny"],
-                config.BACKGROUND,
-                center=(center[0], center[1] + 14),
-            )
+        # Score display
+        score_font = get_font(28, bold=True)
+        score_txt = score_font.render(f"Score: You {self.session.player_wins} - {self.session.ai_wins} AI", True, TEXT_LIGHT)
+        surface.blit(score_txt, score_txt.get_rect(center=(WIDTH // 2, 45)))
 
-        # Flying tokens and the winner glow during resolution.
-        if self.phase == "resolve" and self.result is not None:
-            result = self.result
-            progress = ease_in_quad(min(1.0, self._resolve_t / self._token_travel))
-            player_pos = (
-                lerp(self._player_token_pos[0], self._center[0], progress),
-                lerp(self._player_token_pos[1], self._center[1], progress),
-            )
-            ai_pos = (
-                lerp(self._ai_token_pos[0], self._center[0], progress),
-                lerp(self._ai_token_pos[1], self._center[1], progress),
-            )
-            self._draw_token(surface, result.player_choice, player_pos, offset)
-            self._draw_token(surface, result.ai_choice, ai_pos, offset)
-            if self._reveal_started and result.outcome != "tie":
-                glow_element = result.player_choice if result.outcome == "win" else result.ai_choice
-                glow_pos = player_pos if result.outcome == "win" else ai_pos
-                glow_radius = 46 + 6 * math.sin(pygame.time.get_ticks() / 1000.0 * config.GLOW_PULSE_SPEED)
-                pygame.draw.circle(
-                    surface,
-                    config.ELEMENT_COLORS[glow_element],
-                    (int(glow_pos[0] + offset[0]), int(glow_pos[1] + offset[1])),
-                    int(glow_radius),
-                    width=4,
-                )
-            if self._reveal_started:
-                banner, color = OUTCOME_BANNERS[result.outcome]
-                draw_text(
-                    surface, banner, fonts["h1"], color, center=(config.WINDOW_WIDTH / 2, config.WINDOW_HEIGHT * 0.62)
-                )
-        elif self.phase == "choose":
-            draw_text(
-                surface,
-                "Choose your element!",
-                fonts["body"],
-                config.TEXT_DIM,
-                center=(config.WINDOW_WIDTH / 2, config.WINDOW_HEIGHT * 0.42),
-            )
+        # Combo display
+        if self.session.player_combo > 0:
+            combo_font = get_font(22 + self.session.player_combo * 2, bold=True)
+            combo_color = (min(255, 200 + self.session.player_combo * 10), max(0, 100 - self.session.player_combo * 10), 0)
+            combo_txt = combo_font.render(f"COMBO! {self.session.player_combo}x", True, combo_color)
+            combo_rect = combo_txt.get_rect(center=(WIDTH // 2, 100))
+            draw_glow_circle(surface, combo_rect.center, combo_rect.width // 4, combo_color, intensity=2)
+            surface.blit(combo_txt, combo_rect)
 
-        if self.phase == "countdown":
-            self.countdown.draw(surface)
-        for button in self.element_buttons:
-            button.draw(surface)
+        if self.hint_text:
+            hint_surf = get_font(20).render(self.hint_text, True, ACCENT_WARNING)
+            surface.blit(hint_surf, hint_surf.get_rect(center=(WIDTH // 2, 140)))
+
+        # Enhanced Arena Clash Animation
+        if self.selected_choice and self.ai_choice_display:
+            elapsed = pygame.time.get_ticks() - self.clash_animation_start_time
+            t = min(1, elapsed / self.clash_duration)
+            eased_t = ease_out_cubic(t)
+
+            # Player Choice Movement (from left to center)
+            p_start_x, p_start_y = WIDTH // 2 - 350, HEIGHT // 2
+            p_end_x, p_end_y = WIDTH // 2 - 90, HEIGHT // 2
+            current_p_x = p_start_x + (p_end_x - p_start_x) * eased_t
+            current_p_y = p_start_y + (p_end_y - p_start_y) * eased_t
+
+            # AI Choice Movement (from right to center)
+            ai_start_x, ai_start_y = WIDTH // 2 + 350, HEIGHT // 2
+            ai_end_x, ai_end_y = WIDTH // 2 + 90, HEIGHT // 2
+            current_ai_x = ai_start_x + (ai_end_x - ai_start_x) * eased_t
+            current_ai_y = ai_start_y + (ai_end_y - ai_start_y) * eased_t
+
+            # Scale elements after clash
+            p_scale = 1.0
+            ai_scale = 1.0
+            if t >= 1.0:
+                if self.result_display_text.startswith("VICTORY"):
+                    p_scale = 1.3
+                elif self.result_display_text.startswith("DEFEAT"):
+                    ai_scale = 1.3
+
+            self.draw_clash_card(surface, self.selected_choice, (current_p_x, current_p_y), scale=p_scale)
+            self.draw_clash_card(surface, self.ai_choice_display, (current_ai_x, current_ai_y), scale=ai_scale)
+
+            # Shockwave Ring at impact point (only during clash)
+            if t > 0.4 and t < 0.8:
+                ring_radius = int(80 + (t - 0.4) * 200)
+                ring_alpha = max(0, int(200 * (1 - (t - 0.4) / 0.4))) # Fade out
+                ring_surf = pygame.Surface((ring_radius * 2, ring_radius * 2), pygame.SRCALPHA)
+                pygame.draw.circle(ring_surf, (*self.result_color, ring_alpha), (ring_radius, ring_radius), ring_radius, width=4)
+                surface.blit(ring_surf, (WIDTH // 2 - ring_radius, HEIGHT // 2 - ring_radius))
+                draw_glow_circle(surface, (WIDTH // 2, HEIGHT // 2), 90, self.result_color, intensity=4)
+
+            if t >= 0.9 and self.result_display_text != "":
+                res_font = get_font(46, bold=True)
+                res_surf = res_font.render(self.result_display_text, True, self.result_color)
+                surface.blit(res_surf, res_surf.get_rect(center=(WIDTH // 2, HEIGHT // 2 - 160)))
+
+        # Draw Power-Ups
+        for pu in self.power_ups:
+            info = pu.get_display_info()
+            current_y = pu.y + pu.float_offset
+            draw_glow_circle(surface, (pu.x, int(current_y)), pu.radius, info["color"], intensity=3)
+            pygame.draw.circle(surface, info["color"], (pu.x, int(current_y)), pu.radius)
+            sym_font = get_font(20, bold=True)
+            sym_surf = sym_font.render(info["symbol"], True, TEXT_LIGHT)
+            surface.blit(sym_surf, sym_surf.get_rect(center=(pu.x, int(current_y))))
+
+        # Element Cards at bottom
+        card_w, card_h = 150, 160
+        start_x = (WIDTH - (6 * 165)) // 2
+        y = HEIGHT - 190
+        mouse_pos = pygame.mouse.get_pos()
+
+        for i, elem in enumerate(ELEMENTS):
+            cx = start_x + i * 165
+            rect = pygame.Rect(cx, y, card_w, card_h)
+            hovered = rect.collidepoint(mouse_pos)
+            can_afford = self.session.can_afford(elem)
+
+            scale_factor = 1.0
+            lift_offset = 0
+            if hovered and can_afford and self.selected_choice is None:
+                scale_factor = 1.08
+                lift_offset = -10
+                draw_glow_circle(surface, (rect.centerx, rect.centery + lift_offset), int(card_w * 0.6), ELEMENT_THEMES[elem]["glow"], intensity=2)
+
+            self.draw_element_card(surface, elem, (rect.centerx, rect.centery + lift_offset),
+                                   scale=scale_factor, is_selected=(self.selected_choice == elem),
+                                   is_enabled=can_afford, hovered=hovered)
+
+        self.particles.draw(surface)
+
+    def draw_element_card(self, surface, element, center_pos, scale=1.0, is_selected=False, is_enabled=True, hovered=False):
+        card_w, card_h = int(150 * scale), int(160 * scale)
+        rect = pygame.Rect(0, 0, card_w, card_h)
+        rect.center = center_pos
+
+        theme = ELEMENT_THEMES[element]
+        bg_top = theme["primary"]
+        bg_bot = theme["gradient"]
+
+        current_bg_top = bg_top if is_enabled else (bg_top[0]//3, bg_top[1]//3, bg_top[2]//3)
+        current_bg_bot = bg_bot if is_enabled else (bg_bot[0]//3, bg_bot[1]//3, bg_bot[2]//3)
+
+        draw_gradient_rect(surface, rect, current_bg_top, current_bg_bot, radius=14)
+
+        border_color = theme["glow"] if hovered or is_selected else (71, 85, 105)
+        if not is_enabled:
+            border_color = (border_color[0]//2, border_color[1]//2, border_color[2]//2)
+        pygame.draw.rect(surface, border_color, rect, width=2, border_radius=14)
+
+        if is_selected:
+            pulse_alpha = int(100 + 50 * math.sin(pygame.time.get_ticks() * 0.008))
+            draw_glow_circle(surface, center_pos, rect.width // 2, theme["glow"], intensity=2)
+
+        draw_element_icon(surface, element, (rect.centerx, rect.y + 55), int(38 * scale))
+
+        name_font_size = int(22 * scale)
+        name_font = get_font(name_font_size, bold=True)
+        name_surf = name_font.render(RULES[element]["name"], True, TEXT_LIGHT if is_enabled else TEXT_MUTED)
+        name_rect = name_surf.get_rect(center=(rect.centerx, rect.y + card_h - (35 * scale)))
+        surface.blit(name_surf, name_rect)
+
+        if not is_enabled:
+            lock_font = get_font(int(14 * scale))
+            lock_surf = lock_font.render(f"Need {RULES[element]['energy_cost']} En", True, ACCENT_DANGER)
+            surface.blit(lock_surf, lock_surf.get_rect(center=(rect.centerx, rect.y + card_h - (12 * scale))))
+
+    def draw_clash_card(self, surface, element, center_pos, scale=1.0):
+        card_w, card_h = int(140 * scale), int(150 * scale)
+        rect = pygame.Rect(0, 0, card_w, card_h)
+        rect.center = center_pos
+
+        theme = ELEMENT_THEMES[element]
+        draw_gradient_rect(surface, rect, theme["primary"], theme["gradient"], radius=16)
+        pygame.draw.rect(surface, theme["glow"], rect, width=3, border_radius=16)
+
+        draw_element_icon(surface, element, (rect.centerx, rect.centery - 15), int(45 * scale))
+
+        name_font = get_font(20, bold=True)
+        name_surf = name_font.render(RULES[element]["name"], True, TEXT_LIGHT)
+        surface.blit(name_surf, name_surf.get_rect(center=(rect.centerx, rect.y + card_h - 25)))
 
 
-GLYPHS: dict[str, str] = {
-    "rock": "\u25cf",
-    "paper": "\u25af",
-    "scissors": "\u00d7",
-    "fire": "\u25b2",
-    "water": "\u25bc",
-    "earth": "\u25a0",
-}
+class GameOverState(BaseState):
+    def __init__(self, machine):
+        super().__init__(machine)
+        self.font = get_font(52, bold=True)
+        self.sub_font = get_font(28)
+        self.menu_btn = Button(WIDTH // 2 - 180, HEIGHT // 2 + 100, 360, 70, "Return to Main Menu", font=get_font(28, bold=True))
+        self.winner = ""
+        self.session = None
 
-OUTCOME_BANNERS: dict[str, tuple[str, tuple[int, int, int]]] = {
-    "win": ("YOU WIN THE ROUND", config.SUCCESS),
-    "lose": ("YOU LOSE THE ROUND", config.DANGER),
-    "tie": ("TIE", config.TEXT_DIM),
-}
-
-
-def darken_for_token(color: tuple[int, int, int]) -> tuple[int, int, int]:
-    """Border color for tokens: a moderately darkened element color."""
-    return tuple(int(channel * 0.55) for channel in color)  # type: ignore[return-value]
-
-
-# ---------------------------------------------------------------------------
-# Result
-# ---------------------------------------------------------------------------
-
-
-class ResultState(AppState):
-    """Match outcome screen with rematch / mode / menu options."""
-
-    def __init__(self, game: Game) -> None:
-        """Create the three outcome buttons."""
-        super().__init__(game)
-        self.winner: str | None = None
-        self.stats: dict[str, Any] = {}
-        button_width = 260
-        self.rematch_button = Button(
-            pygame.Rect(0, 0, button_width, config.BUTTON_HEIGHT), "Rematch", self.game.fonts["h2"]
-        )
-        self.mode_button = Button(
-            pygame.Rect(0, 0, button_width, config.BUTTON_HEIGHT), "Change Mode", self.game.fonts["h2"]
-        )
-        self.menu_button = Button(
-            pygame.Rect(0, 0, button_width, config.BUTTON_HEIGHT), "Main Menu", self.game.fonts["h2"]
-        )
-        x = config.WINDOW_WIDTH / 2 - button_width - 20
-        for button in (self.rematch_button, self.mode_button, self.menu_button):
-            button.rect.center = (x, config.WINDOW_HEIGHT * 0.72)
-            x += button_width + 40
-
-    def enter(
-        self,
-        winner: str | None = None,
-        rounds: int = 0,
-        best_of: int = 3,
-        max_combo: int = 0,
-        player_hp: int = 0,
-        ai_hp: int = 0,
-        **_: Any,
-    ) -> None:
-        """Store the outcome and summary stats for drawing."""
+    def enter(self, winner="player", session=None):
         self.winner = winner
-        self.stats = {
-            "rounds": rounds,
-            "best_of": best_of,
-            "max_combo": max_combo,
-            "player_hp": player_hp,
-            "ai_hp": ai_hp,
-        }
+        self.session = session
 
-    def handle_event(self, event: pygame.event.Event) -> None:
-        """Route the three buttons; Esc returns to the menu."""
-        if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
-            self.game.machine.change_state("menu")
-            return
-        if self.rematch_button.handle_event(event):
-            self.game.play_sound("click")
-            self.game.machine.change_state("game", best_of=self.stats["best_of"])
-        elif self.mode_button.handle_event(event):
-            self.game.play_sound("click")
-            self.game.machine.change_state("mode")
-        elif self.menu_button.handle_event(event):
-            self.game.play_sound("click")
-            self.game.machine.change_state("menu")
+    def handle_event(self, event):
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            if self.menu_btn.update(event.pos, True):
+                self.machine.change_state("menu")
 
-    def update(self, dt: float) -> None:
-        """Refresh hover states."""
-        for button in (self.rematch_button, self.mode_button, self.menu_button):
-            button.update(dt)
+    def update(self):
+        self.update_bg()
+        self.menu_btn.update(pygame.mouse.get_pos(), False)
 
-    def draw(self, surface: pygame.Surface, offset: tuple[float, float]) -> None:
-        """Render the outcome banner, stats and buttons."""
-        titles = {
-            "player": ("VICTORY!", config.SUCCESS),
-            "ai": ("DEFEAT", config.DANGER),
-            "draw": ("DRAW", config.TEXT_DIM),
-        }
-        title, color = titles.get(self.winner or "draw", ("DRAW", config.TEXT_DIM))
-        draw_text(
-            surface,
-            title,
-            self.game.fonts["title"],
-            color,
-            center=(config.WINDOW_WIDTH / 2, config.WINDOW_HEIGHT * 0.30),
-        )
-        draw_text(
-            surface,
-            f"Rounds played: {self.stats['rounds']} / {self.stats['best_of']}   -   Best combo: x{self.stats['max_combo']}   -   Final HP  You {self.stats['player_hp']} : AI {self.stats['ai_hp']}",
-            self.game.fonts["body"],
-            config.TEXT,
-            center=(config.WINDOW_WIDTH / 2, config.WINDOW_HEIGHT * 0.46),
-        )
-        for button in (self.rematch_button, self.mode_button, self.menu_button):
-            button.draw(surface)
+    def draw(self, surface):
+        self.draw_bg(surface)
 
+        msg = "VICTORY! You won the match!" if self.winner == "player" else ("DEFEAT! AI won the match." if self.winner == "ai" else "IT'S A TIE!")
+        color = ACCENT_SUCCESS if self.winner == "player" else (ACCENT_DANGER if self.winner == "ai" else ACCENT_WARNING)
 
-# A module-level type alias used by type checkers; Callable comes from
-# collections.abc and is re-exported for providers configured by embedders.
-ProviderFactory = Callable[[], str]
+        t_surf = self.font.render(msg, True, color)
+        surface.blit(t_surf, t_surf.get_rect(center=(WIDTH // 2, HEIGHT // 2 - 80)))
+
+        if self.session:
+            score_txt = f"Final Score: You {self.session.player_wins} - {self.session.ai_wins} AI"
+            s_surf = self.sub_font.render(score_txt, True, TEXT_LIGHT)
+            surface.blit(s_surf, s_surf.get_rect(center=(WIDTH // 2, HEIGHT // 2)))
+
+        self.menu_btn.draw(surface)

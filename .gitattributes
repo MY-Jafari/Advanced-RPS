@@ -1,2 +1,44 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Python files - always LF
+*.py text eol=lf
+
+# Configuration files - always LF
+*.toml text eol=lf
+*.ini text eol=lf
+*.cfg text eol=lf
+*.json text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+
+# Documentation - always LF
+*.md text eol=lf
+*.rst text eol=lf
+*.txt text eol=lf
+
+# Image files - binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.svg binary
+
+# Audio files - binary
+*.mp3 binary
+*.wav binary
+*.ogg binary
+
+# Font files - binary
+*.ttf binary
+*.otf binary
+*.woff binary
+*.woff2 binary
+
+# Other binary
+*.pyc binary
+*.pyo binary
+*.pyd binary
+*.so binary
+*.dll binary
